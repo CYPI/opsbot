@@ -2,62 +2,83 @@ package main
 
 import (
 	"log"
-	"net/http"
+	"os"
 
-	"github.com/kelseyhightower/envconfig"
+	"github.com/Krognol/go-wolfram"
+	"github.com/christianrondeau/go-wit"
 	"github.com/slack-go/slack"
 )
 
-// https://api.slack.com/slack-apps
-// https://api.slack.com/internal-integrations
-type envConfig struct {
-	// Port is server port to be listened.
-	Port string `envconfig:"PORT" default:"3000"`
+const confidenceThreshold = 0.5
 
-	// BotToken is bot user token to access to slack API.
-	BotToken string `envconfig:"BOT_TOKEN" required:"true"`
-
-	// VerificationToken is used to validate interactive messages from slack.
-	VerificationToken string `envconfig:"VERIFICATION_TOKEN" required:"true"`
-
-	// BotID is bot user ID.
-	BotID string `envconfig:"BOT_ID" required:"true"`
-
-	// ChannelID is slack channel ID where bot is working.
-	// Bot responses to the mention in this channel.
-	ChannelID string `envconfig:"CHANNEL_ID" required:"true"`
-}
+var (
+	slackClient   *slack.Client
+	witClient     *wit.Client
+	wolframClient *wolfram.Client
+)
 
 func main() {
-	var env envConfig
-	err := envconfig.Process("cortex", &env)
+	slackClient = slack.New(os.Getenv("SLACK_ACCESS_TOKEN"))
+	witClient = wit.NewClient(os.Getenv("WIT_AI_ACCESS_TOKEN"))
+	wolframClient = &wolfram.Client{AppID: os.Getenv("WOLFRAM_APP_ID")}
+
+	rtm := slackClient.NewRTM()
+	go rtm.ManageConnection()
+
+	for msg := range rtm.IncomingEvents {
+		switch ev := msg.Data.(type) {
+		case *slack.MessageEvent:
+			if len(ev.BotID) == 0 {
+				go handleMessage(ev)
+			}
+		}
+	}
+}
+
+func handleMessage(ev *slack.MessageEvent) {
+	result, err := witClient.Message(ev.Msg.Text)
 	if err != nil {
-		log.Fatal(err.Error())
-		return 1
+		log.Printf("unable to get wit.ai result: %v", err)
+		return
 	}
 
-	// Listening slack event and response
-	log.Printf("[INFO] Start slack event listening")
-	client := slack.New(env.BotToken)
-	slackListener := &SlackListener{
-		client:    client,
-		botID:     env.BotID,
-		channelID: env.ChannelID,
-	}
-	go slackListener.ListenAndResponse()
+	var (
+		topEntity    wit.MessageEntity
+		topEntityKey string
+	)
 
-	// Register handler to receive interactive message
-	// responses from slack (kicked by user action)
-	http.Handle("/interaction", interactionHandler{
-		verificationToken: env.VerificationToken,
+	for key, entityList := range result.Entities {
+		for _, entity := range entityList {
+			if entity.Confidence > confidenceThreshold && entity.Confidence > topEntity.Confidence {
+				topEntity = entity
+				topEntityKey = key
+			}
+		}
+	}
+
+	replyToUser(ev, topEntity, topEntityKey)
+}
+
+func replyToUser(ev *slack.MessageEvent, topEntity wit.MessageEntity, topEntityKey string) {
+	switch topEntityKey {
+	case "greetings":
+		slackClient.PostMessage(ev.User, "Hello user! How can I help you?", slack.PostMessageParameters{
+			AsUser: true,
+		})
+		return
+	case "wolfram_search_query":
+		res, err := wolframClient.GetSpokentAnswerQuery(topEntity.Value.(string), wolfram.Metric, 1000)
+		if err == nil {
+			slackClient.PostMessage(ev.User, res, slack.PostMessageParameters{
+				AsUser: true,
+			})
+			return
+		}
+
+		log.Printf("unable to get data from wolfram: %v", err)
+	}
+
+	slackClient.PostMessage(ev.User, "¯\\_(o_o)_/¯", slack.PostMessageParameters{
+		AsUser: true,
 	})
-
-	log.Printf("[INFO] Server listening on :%s", env.Port)
-	if err := http.ListenAndServe(":"+env.Port, nil); err != nil {
-		log.Printf("[ERROR] %s", err)
-		return 1
-	}
-
-	return 0
-
 }
